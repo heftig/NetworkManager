@@ -535,6 +535,12 @@ plugin_get_hostname (SCPluginKeyfile *plugin)
 
 	hostname = g_key_file_get_value (key_file, "keyfile", "hostname", NULL);
 
+	if (hostname && *hostname) {
+		nm_log_warn (LOGD_SETTINGS,
+		             "In file '%s': hostname key is deprecated, prefer /etc/hostname",
+		             priv->conf_file);
+	}
+
  out:
 	if (error) {
 		nm_log_warn (LOGD_SETTINGS, "%s", error->message);
