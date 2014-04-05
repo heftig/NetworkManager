@@ -40,7 +40,6 @@
 #include "nm-vpn-manager.h"
 #include "nm-auth-utils.h"
 #include "nm-firewall-manager.h"
-#include "nm-dispatcher.h"
 #include "nm-utils.h"
 #include "nm-glib-compat.h"
 #include "nm-manager.h"
@@ -48,6 +47,7 @@
 #include "nm-settings-connection.h"
 #include "nm-dhcp4-config.h"
 #include "nm-dhcp6-config.h"
+#include "nm-hostname-manager.h"
 
 typedef struct {
 	NMManager *manager;
@@ -74,9 +74,8 @@ typedef struct {
 
 	gint reset_retries_id;  /* idle handler for resetting the retries count */
 
+	NMHostnameManager *hostname_manager;
 	char *orig_hostname; /* hostname at NM start time */
-	char *cur_hostname;  /* hostname we want to assign */
-	gboolean hostname_changed;  /* TRUE if NM ever set the hostname */
 } NMPolicyPrivate;
 
 #define NM_POLICY_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE ((o), NM_TYPE_POLICY, NMPolicyPrivate))
@@ -259,43 +258,6 @@ get_best_ip6_device (NMPolicy *self, gboolean fully_activated)
 	return best;
 }
 
-#define FALLBACK_HOSTNAME4 "localhost.localdomain"
-
-static gboolean
-set_system_hostname (const char *new_hostname, const char *msg)
-{
-	char old_hostname[HOST_NAME_MAX + 1];
-	const char *name;
-	int ret;
-
-	if (new_hostname)
-		g_warn_if_fail (strlen (new_hostname));
-
-	old_hostname[HOST_NAME_MAX] = '\0';
-	errno = 0;
-	ret = gethostname (old_hostname, HOST_NAME_MAX);
-	if (ret != 0) {
-		nm_log_warn (LOGD_DNS, "couldn't get the system hostname: (%d) %s",
-		             errno, strerror (errno));
-	} else {
-		/* Don't set the hostname if it isn't actually changing */
-		if (   (new_hostname && !strcmp (old_hostname, new_hostname))
-		       || (!new_hostname && !strcmp (old_hostname, FALLBACK_HOSTNAME4)))
-			return FALSE;
-	}
-
-	name = (new_hostname && strlen (new_hostname)) ? new_hostname : FALLBACK_HOSTNAME4;
-
-	nm_log_info (LOGD_DNS, "Setting system hostname to '%s' (%s)", name, msg);
-	ret = sethostname (name, strlen (name));
-	if (ret != 0) {
-		nm_log_warn (LOGD_DNS, "couldn't set the system hostname to '%s': (%d) %s",
-		             name, errno, strerror (errno));
-	}
-
-	return (ret == 0);
-}
-
 static void
 _set_hostname (NMPolicy *policy,
                const char *new_hostname,
@@ -304,9 +266,7 @@ _set_hostname (NMPolicy *policy,
 	NMPolicyPrivate *priv = NM_POLICY_GET_PRIVATE (policy);
 
 	/* The incoming hostname *can* be NULL, which will get translated to
-	 * 'localhost.localdomain' or such in the hostname policy code, but we
-	 * keep cur_hostname = NULL in the case because we need to know that
-	 * there was no valid hostname to start with.
+	 * 'localhost.localdomain' or such in the hostname policy code.
 	 */
 
 	/* Clear lookup adresses if we have a hostname, so that we don't
@@ -315,28 +275,10 @@ _set_hostname (NMPolicy *policy,
 	if (new_hostname)
 		g_clear_object (&priv->lookup_addr);
 
-	/* Don't change the hostname or update DNS this is the first time we're
-	 * trying to change the hostname, and it's not actually changing.
-	 */
-	if (   priv->orig_hostname
-	    && (priv->hostname_changed == FALSE)
-	    && g_strcmp0 (priv->orig_hostname, new_hostname) == 0)
-		return;
+	nm_log_info (LOGD_DNS, "Using hostname '%s' (%s)", new_hostname, msg);
 
-	/* Don't change the hostname or update DNS if the hostname isn't actually
-	 * going to change.
-	 */
-	if (g_strcmp0 (priv->cur_hostname, new_hostname) == 0)
-		return;
-
-	g_free (priv->cur_hostname);
-	priv->cur_hostname = g_strdup (new_hostname);
-	priv->hostname_changed = TRUE;
-
-	nm_dns_manager_set_hostname (priv->dns_manager, priv->cur_hostname);
-
-	if (set_system_hostname (priv->cur_hostname, msg))
-		nm_dispatcher_call (DISPATCHER_ACTION_HOSTNAME, NULL, NULL, NULL, NULL, NULL);
+	nm_hostname_manager_set_hostname (priv->hostname_manager, new_hostname);
+	nm_dns_manager_set_hostname (priv->dns_manager, new_hostname);
 }
 
 static void
@@ -2074,7 +2016,6 @@ nm_policy_new (NMManager *manager, NMSettings *settings)
 	NMPolicy *policy;
 	NMPolicyPrivate *priv;
 	static gboolean initialized = FALSE;
-	char hostname[HOST_NAME_MAX + 2];
 
 	g_return_val_if_fail (NM_IS_MANAGER (manager), NULL);
 	g_return_val_if_fail (initialized == FALSE, NULL);
@@ -2085,12 +2026,16 @@ nm_policy_new (NMManager *manager, NMSettings *settings)
 	priv->settings = g_object_ref (settings);
 	priv->update_state_id = 0;
 
+	priv->hostname_manager = nm_hostname_manager_get ();
+
 	/* Grab hostname on startup and use that if nothing provides one */
-	memset (hostname, 0, sizeof (hostname));
-	if (gethostname (&hostname[0], HOST_NAME_MAX) == 0) {
-		/* only cache it if it's a valid hostname */
-		if (*hostname && nm_utils_is_specific_hostname (hostname))
-			priv->orig_hostname = g_strdup (hostname);
+	priv->orig_hostname = nm_hostname_manager_get_hostname (priv->hostname_manager);
+
+	/* only cache it if it's a valid hostname */
+	if (!nm_utils_is_specific_hostname (priv->orig_hostname)) {
+		/* also run when the hostname is NULL, but that's okay */
+		g_free (priv->orig_hostname);
+		priv->orig_hostname = NULL;
 	}
 
 	priv->fw_started_id = g_signal_connect (nm_firewall_manager_get (), "started",
@@ -2239,7 +2184,6 @@ dispose (GObject *object)
 	}
 
 	g_clear_pointer (&priv->orig_hostname, g_free);
-	g_clear_pointer (&priv->cur_hostname, g_free);
 
 	g_clear_object (&priv->settings);
 

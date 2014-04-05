@@ -57,6 +57,7 @@
 #include "nm-dispatcher.h"
 #include "nm-settings.h"
 #include "nm-auth-manager.h"
+#include "nm-hostname-manager.h"
 
 #if !defined(NM_DIST_VERSION)
 # define NM_DIST_VERSION VERSION
@@ -354,6 +355,7 @@ main (int argc, char *argv[])
 	gs_unref_object NMSettings *settings = NULL;
 	gs_unref_object NMConfig *config = NULL;
 	gs_unref_object NMSessionMonitor *session_monitor = NULL;
+	gs_unref_object NMHostnameManager *hostname_mgr = NULL;
 	GError *error = NULL;
 	gboolean wrote_pidfile = FALSE;
 	char *bad_domains = NULL;
@@ -598,6 +600,9 @@ main (int argc, char *argv[])
 	/* Initialize our DBus service & connection */
 	dbus_mgr = nm_dbus_manager_get ();
 	g_assert (dbus_mgr != NULL);
+
+	hostname_mgr = nm_hostname_manager_new ();
+	g_assert (hostname_mgr != NULL);
 
 	vpn_manager = nm_vpn_manager_get ();
 	g_assert (vpn_manager != NULL);

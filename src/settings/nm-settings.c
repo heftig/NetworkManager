@@ -70,6 +70,7 @@
 #include "nm-connection-provider.h"
 #include "nm-config.h"
 #include "NetworkManagerUtils.h"
+#include "nm-hostname-manager.h"
 
 /* LINKER CRACKROCK */
 #define EXPORT(sym) void * __export_##sym = &sym;
@@ -129,6 +130,8 @@ G_DEFINE_TYPE_EXTENDED (NMSettings, nm_settings, G_TYPE_OBJECT, 0,
 
 typedef struct {
 	NMDBusManager *dbus_mgr;
+
+	NMHostnameManager *hostname_mgr;
 
 	NMAgentManager *agent_mgr;
 
@@ -459,11 +462,17 @@ nm_settings_get_hostname (NMSettings *self)
 {
 	NMSettingsPrivate *priv = NM_SETTINGS_GET_PRIVATE (self);
 	GSList *iter;
-	char *hostname = NULL;
+	char *hostname;
 
-	/* Hostname returned is the hostname returned from the first plugin
-	 * that provides one.
-	 */
+	/* First try the hostname manager */
+	hostname = nm_hostname_manager_get_static_hostname (priv->hostname_mgr);
+
+	if (hostname && *hostname)
+		return hostname;
+
+	g_free (hostname);
+
+	/* As fallback, select the hostname returned from the first plugin that provides one. */
 	for (iter = priv->plugins; iter; iter = iter->next) {
 		NMSystemConfigInterfaceCapabilities caps = NM_SYSTEM_CONFIG_INTERFACE_CAP_NONE;
 
@@ -540,7 +549,7 @@ unrecognized_specs_changed (NMSystemConfigInterface *config,
 }
 
 static void
-hostname_changed (NMSystemConfigInterface *config,
+hostname_changed (GObject *object,
                   GParamSpec *pspec,
                   gpointer user_data)
 {
@@ -1369,8 +1378,11 @@ pk_hostname_cb (NMAuthChain *chain,
 		                             NM_SETTINGS_ERROR_PERMISSION_DENIED,
 		                             "Insufficient privileges.");
 	} else {
-		/* Set the hostname in all plugins */
+		/* Set the hostname on the manager */
 		hostname = nm_auth_chain_get_data (chain, "hostname");
+		nm_hostname_manager_set_static_hostname (priv->hostname_mgr, hostname);
+
+		/* Set the hostname in all plugins */
 		for (iter = priv->plugins; iter; iter = iter->next) {
 			NMSystemConfigInterfaceCapabilities caps = NM_SYSTEM_CONFIG_INTERFACE_CAP_NONE;
 
@@ -1792,6 +1804,10 @@ nm_settings_init (NMSettings *self)
 
 	priv->connections = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, g_object_unref);
 
+	priv->hostname_mgr = nm_hostname_manager_get ();
+	g_signal_connect (priv->hostname_mgr, "notify::" NM_HOSTNAME_MANAGER_STATIC_HOSTNAME,
+	                  G_CALLBACK (hostname_changed), self);
+
 	/* Hold a reference to the agent manager so it stays alive; the only
 	 * other holders are NMSettingsConnection objects which are often
 	 * transient, and we don't want the agent manager to get destroyed and
@@ -1813,7 +1829,12 @@ dispose (GObject *object)
 
 	priv->dbus_mgr = NULL;
 
-	g_object_unref (priv->agent_mgr);
+	g_clear_object (&priv->agent_mgr);
+
+	if (priv->hostname_mgr) {
+		g_signal_handlers_disconnect_by_data (priv->hostname_mgr, self);
+		g_clear_object (&priv->hostname_mgr);
+	}
 
 	G_OBJECT_CLASS (nm_settings_parent_class)->dispose (object);
 }
